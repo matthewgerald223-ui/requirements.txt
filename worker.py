@@ -1,71 +1,57 @@
 import hashlib
 import os
-from typing import Any, Dict, List
-
 import requests
 
-VAULT_INGEST_URL = os.environ.get(
-    "VAULT_INGEST_URL",
-    "https://txt-w86d.onrender.com/ingest-result",
-)
+API_BASE_URL = os.getenv("API_URL", "https://txt-w86d.onrender.com").rstrip("/")
 
+# Replace "/your-post-route" with the exact @app.post("...") path from main.py
+PREFERRED_ENDPOINT = os.getenv("API_ENDPOINT", "/your-post-route")
 
-def fetch_external_results() -> List[Dict[str, Any]]:
-    """
-    Replace this mock list with your real data/image source
-    (e.g., external JSON feed, CSV/API, or downloaded EC8A image bytes).
-    """
-    sample_image_bytes = b"sample-ec8a-sheet-001"
-    return [
-        {
-            "polling_unit_code": "22-01-01-001",
-            "lga_name": "Idah",
-            "ward_name": "Idah",
-            "sdp_votes": 10,
-            "apc_votes": 25,
-            "pdp_votes": 15,
-            "lp_votes": 5,
-            "other_party_votes": 0,
-            "total_accredited_voters": 100,
-            "total_valid_votes": 55,
-            "rejected_votes": 5,
-            "source_image_url": "https://example.com/ec8a/22-01-01-001.jpg",
-            "raw_image_bytes": sample_image_bytes,
-            "anomaly_flags": [],
-        }
-    ]
+# Fallback paths to try only if PREFERRED_ENDPOINT is still a placeholder or returns 404
+CANDIDATE_ENDPOINTS = [
+    PREFERRED_ENDPOINT,
+    "/ingest",
+    "/submit",
+    "/ec8a",
+    "/ec8a/submit",
+    "/results",
+    "/results/submit",
+    "/audit",
+]
 
+sample_image_bytes = b"sample-kogi-ec8a-sheet-bytes"
+image_sha256 = hashlib.sha256(sample_image_bytes).hexdigest()
 
-def build_ingest_payload(item: Dict[str, Any]) -> Dict[str, Any]:
-    raw_bytes: bytes = item["raw_image_bytes"]
-    return {
-        "polling_unit_code": item["polling_unit_code"],
-        "lga_name": item["lga_name"],
-        "ward_name": item["ward_name"],
-        "sdp_votes": item.get("sdp_votes", 0),
-        "apc_votes": item.get("apc_votes", 0),
-        "pdp_votes": item.get("pdp_votes", 0),
-        "lp_votes": item.get("lp_votes", 0),
-        "other_party_votes": item.get("other_party_votes", 0),
-        "total_accredited_voters": item.get("total_accredited_voters", 0),
-        "total_valid_votes": item.get("total_valid_votes", 0),
-        "rejected_votes": item.get("rejected_votes", 0),
-        "source_image_url": item["source_image_url"],
-        "raw_image_bytes_hex": raw_bytes.hex(),
-        "anomaly_flags": item.get("anomaly_flags", []),
-    }
+payload = {
+    "polling_unit_code": "22-01-01-001",
+    "ward": "Sample Ward",
+    "lga": "Idah",
+    "accredited_voters": 250,
+    "party_votes": {
+        "APC": 100,
+        "PDP": 90,
+        "LP": 40,
+    },
+    "image_sha256": image_sha256,
+}
 
+seen = set()
+for endpoint in CANDIDATE_ENDPOINTS:
+    if not endpoint or endpoint == "/your-post-route" or endpoint in seen:
+        continue
+    seen.add(endpoint)
 
-def push_to_vault(payload: Dict[str, Any]) -> None:
-    res = requests.post(VAULT_INGEST_URL, json=payload, timeout=30)
-    print(f"PU={payload['polling_unit_code']} -> HTTP {res.status_code}: {res.text}")
-
-
-def main() -> None:
-    for item in fetch_external_results():
-        payload = build_ingest_payload(item)
-        push_to_vault(payload)
-
-
-if __name__ == "__main__":
-    main()
+    url = f"{API_BASE_URL}{endpoint}"
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        print(
+            f"PU={payload['polling_unit_code']} endpoint={endpoint} -> "
+            f"HTTP {response.status_code}: {response.text}"
+        )
+        if response.status_code != 404:
+            break
+    except requests.RequestException as exc:
+        print(
+            f"PU={payload['polling_unit_code']} endpoint={endpoint} -> "
+            f"Request error: {exc}"
+        )
