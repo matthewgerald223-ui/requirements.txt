@@ -1,117 +1,176 @@
 import hashlib
 import os
-from typing import List
+from typing import Any, List
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from supabase import Client, create_client
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
+app = FastAPI(title="Kogi EC8A Audit Vault")
 
-supabase: Client | None = None
-if SUPABASE_URL and SUPABASE_SECRET_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
-
-app = FastAPI(title="Kogi Election Vault Engine", version="0.1.0")
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SECRET_KEY"]
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-class ResultSubmission(BaseModel):
-    polling_unit_code: str = Field(..., min_length=3, max_length=50)
-    lga_name: str = Field(..., min_length=2, max_length=100)
-    ward_name: str = Field(..., min_length=2, max_length=100)
-    sdp_votes: int = Field(0, ge=0)
-    apc_votes: int = Field(0, ge=0)
-    pdp_votes: int = Field(0, ge=0)
-    lp_votes: int = Field(0, ge=0)
-    other_party_votes: int = Field(0, ge=0)
-    total_accredited_voters: int = Field(0, ge=0)
-    total_valid_votes: int = Field(0, ge=0)
-    rejected_votes: int = Field(0, ge=0)
-    source_image_url: str = Field(..., min_length=5)
-    raw_image_bytes_hex: str | None = Field(
-        default=None,
-        description="Optional raw image bytes in hex to compute exact SHA-256 fingerprint",
-    )
+class EC8AResultIn(BaseModel):
+    polling_unit_code: str
+    lga_name: str
+    ward_name: str
+    sdp_votes: int = Field(default=0, ge=0)
+    apc_votes: int = Field(default=0, ge=0)
+    pdp_votes: int = Field(default=0, ge=0)
+    lp_votes: int = Field(default=0, ge=0)
+    other_party_votes: int = Field(default=0, ge=0)
+    total_accredited_voters: int = Field(default=0, ge=0)
+    total_valid_votes: int = Field(default=0, ge=0)
+    rejected_votes: int = Field(default=0, ge=0)
+    source_image_url: str
+    raw_image_bytes_hex: str
+    anomaly_flags: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def reject_votes_exceeding_accredited(self) -> "EC8AResultIn":
+        total_votes_cast = self.total_valid_votes + self.rejected_votes
+        if total_votes_cast > self.total_accredited_voters:
+            raise ValueError(
+                f"Rejected: total votes cast ({total_votes_cast}) exceeds "
+                f"total accredited voters ({self.total_accredited_voters})."
+            )
+        return self
 
 
-def compute_sha256(payload: ResultSubmission) -> str:
-    if payload.raw_image_bytes_hex:
-        raw_bytes = bytes.fromhex(payload.raw_image_bytes_hex.strip())
-        return hashlib.sha256(raw_bytes).hexdigest()
-    # Fallback deterministic fingerprint if raw image bytes aren't passed yet
-    fallback_seed = f"{payload.polling_unit_code}|{payload.source_image_url}".encode("utf-8")
-    return hashlib.sha256(fallback_seed).hexdigest()
+def compute_sha256_from_hex(raw_hex: str) -> str:
+    cleaned = raw_hex.strip()
+    if cleaned.startswith(("0x", "0X")):
+        cleaned = cleaned[2:]
+    try:
+        raw_bytes = bytes.fromhex(cleaned)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="Invalid hex string in raw_image_bytes_hex"
+        ) from exc
+    return hashlib.sha256(raw_bytes).hexdigest()
 
 
-def run_math_audit(data: ResultSubmission) -> List[str]:
-    flags: List[str] = []
+def evaluate_audit_flags(
+    payload: EC8AResultIn,
+    existing_hash_rows: List[dict[str, Any]],
+    existing_pu_rows: List[dict[str, Any]],
+) -> List[str]:
+    flags: List[str] = list(payload.anomaly_flags or [])
+
     party_sum = (
-        data.sdp_votes
-        + data.apc_votes
-        + data.pdp_votes
-        + data.lp_votes
-        + data.other_party_votes
+        payload.sdp_votes
+        + payload.apc_votes
+        + payload.pdp_votes
+        + payload.lp_votes
+        + payload.other_party_votes
     )
-    total_cast = party_sum + data.rejected_votes
+    if party_sum != payload.total_valid_votes:
+        flags.append("party_sum_mismatch")
 
-    if data.total_valid_votes != party_sum:
-        flags.append(
-            f"VALID_VOTE_MISMATCH: stated={data.total_valid_votes}, party_sum={party_sum}"
-        )
+    if existing_hash_rows:
+        flags.append("duplicate_image_hash")
 
-    if data.total_accredited_voters > 0 and total_cast > data.total_accredited_voters:
-        flags.append(
-            f"POSSIBLE_OVER_VOTING: cast={total_cast}, accredited={data.total_accredited_voters}"
-        )
+    if existing_pu_rows:
+        flags.append("duplicate_polling_unit")
 
-    return flags
-
-
-@app.get("/")
-def root():
-    return {
-        "status": "online",
-        "system": "Kogi State Automated Election Monitoring Engine",
-        "vault_connected": supabase is not None,
-    }
+    return list(dict.fromkeys(flags))
 
 
 @app.post("/ingest-result")
-def ingest_result(submission: ResultSubmission):
-    if supabase is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing SUPABASE_URL or SUPABASE_SECRET_KEY environment variables.",
-        )
+def ingest_result(payload: EC8AResultIn):
+    image_sha256 = compute_sha256_from_hex(payload.raw_image_bytes_hex)
 
-    sha256_hash = compute_sha256(submission)
-    anomaly_flags = run_math_audit(submission)
+    dup_hash_res = (
+        supabase.table("kogi_ec8a_results")
+        .select("id, polling_unit_code, ingested_at")
+        .eq("image_sha256", image_sha256)
+        .limit(5)
+        .execute()
+    )
+    dup_pu_res = (
+        supabase.table("kogi_ec8a_results")
+        .select("id, image_sha256, ingested_at")
+        .eq("polling_unit_code", payload.polling_unit_code)
+        .limit(5)
+        .execute()
+    )
+
+    existing_hash_rows = dup_hash_res.data or []
+    existing_pu_rows = dup_pu_res.data or []
+
+    computed_flags = evaluate_audit_flags(
+        payload=payload,
+        existing_hash_rows=existing_hash_rows,
+        existing_pu_rows=existing_pu_rows,
+    )
 
     record = {
-        "polling_unit_code": submission.polling_unit_code.strip(),
-        "lga_name": submission.lga_name.strip(),
-        "ward_name": submission.ward_name.strip(),
-        "sdp_votes": submission.sdp_votes,
-        "apc_votes": submission.apc_votes,
-        "pdp_votes": submission.pdp_votes,
-        "lp_votes": submission.lp_votes,
-        "other_party_votes": submission.other_party_votes,
-        "total_accredited_voters": submission.total_accredited_voters,
-        "total_valid_votes": submission.total_valid_votes,
-        "rejected_votes": submission.rejected_votes,
-        "source_image_url": submission.source_image_url.strip(),
-        "image_sha256": sha256_hash,
-        "anomaly_flags": anomaly_flags,
+        "polling_unit_code": payload.polling_unit_code,
+        "lga_name": payload.lga_name,
+        "ward_name": payload.ward_name,
+        "sdp_votes": payload.sdp_votes,
+        "apc_votes": payload.apc_votes,
+        "pdp_votes": payload.pdp_votes,
+        "lp_votes": payload.lp_votes,
+        "other_party_votes": payload.other_party_votes,
+        "total_accredited_voters": payload.total_accredited_voters,
+        "total_valid_votes": payload.total_valid_votes,
+        "rejected_votes": payload.rejected_votes,
+        "source_image_url": payload.source_image_url,
+        "image_sha256": image_sha256,
+        "anomaly_flags": computed_flags,
     }
 
-    response = supabase.table("kogi_ec8a_results").insert(record).execute()
+    insert_res = supabase.table("kogi_ec8a_results").insert(record).execute()
+    if not insert_res.data:
+        raise HTTPException(status_code=500, detail="Failed to seal record in vault")
+
+    saved_row = insert_res.data[0]
     return {
-        "message": "Record sealed in append-only Kogi vault",
-        "image_sha256": sha256_hash,
-        "anomaly_flags": anomaly_flags,
-        "inserted": response.data,
-}
-  
+        "status": "sealed",
+        "anomaly_flags": computed_flags,
+        "has_anomalies": len(computed_flags) > 0,
+        "duplicate_hash_count": len(existing_hash_rows),
+        "duplicate_pu_count": len(existing_pu_rows),
+        "record": saved_row,
+    }
+
+
+@app.get("/center/{polling_unit_code}")
+def get_center_dossier(polling_unit_code: str):
+    res = (
+        supabase.table("kogi_ec8a_results")
+        .select("*")
+        .eq("polling_unit_code", polling_unit_code)
+        .order("id", desc=True)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No records found for polling unit '{polling_unit_code}'",
+        )
+
+    latest = rows[0]
+    flagged_submissions = [r for r in rows if r.get("anomaly_flags")]
+    unique_hashes = list(
+        {r.get("image_sha256") for r in rows if r.get("image_sha256")}
+    )
+
+    return {
+        "polling_unit_code": polling_unit_code,
+        "lga_name": latest.get("lga_name"),
+        "ward_name": latest.get("ward_name"),
+        "submission_count": len(rows),
+        "unique_image_hashes": len(unique_hashes),
+        "flagged_submission_count": len(flagged_submissions),
+        "latest_submission": latest,
+        "history": rows,
+    }
