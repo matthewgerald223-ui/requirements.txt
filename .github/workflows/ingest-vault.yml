@@ -1,0 +1,27 @@
+name: Ingest Kogi EC8A Results
+
+on:
+  schedule:
+    - cron: "*/15 * * * *" # Runs automatically every 15 minutes
+  workflow_dispatch: # Also lets you trigger a run manually with one tap
+
+jobs:
+  run-feeder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Run automated feeder
+        env:
+          VAULT_INGEST_URL: https://txt-w86d.onrender.com/ingest-result
+        run: python worker.py
+        
